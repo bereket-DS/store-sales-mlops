@@ -3,7 +3,7 @@
 
 /src/bereket/          @bereket-DS
 /pipelines/bereket/    @bereket-DS
-/docker/bereket/       @@bereket-DS
+/docker/bereket/       @bereket-DS
 
 /src/fanuel/           @FanuelMichael
 /pipelines/fanuel/     @FanuelMichael
