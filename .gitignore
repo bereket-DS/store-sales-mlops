@@ -1,0 +1,31 @@
+# Data and artefacts are tracked by DVC, not git. Ignore the CONTENTS of
+# these folders but keep the folders themselves (via .gitkeep), so the layout
+# is in the repo from the first clone.
+data/raw/*
+data/processed/*/*
+models/*/*
+reports/*/*
+!**/.gitkeep
+
+# secrets
+.env
+.dvc/config.local
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# mlflow local fallback
+mlruns/
+mlflow.db
+
+# os / editor
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,16 @@
+# Each member owns their own folders - nobody reviews anyone else's work.
+# src/common/ is the shared evaluation contract, so it needs all three.
+
+/src/bereket/          @bereket-DS
+/pipelines/bereket/    @bereket-DS
+/docker/bereket/       @@bereket-DS
+
+/src/fanuel/           @FanuelMichael
+/pipelines/fanuel/     @FanuelMichael
+/docker/fanuel/        @FanuelMichael
+
+/src/tehreem/          @tehreemkamal111
+/pipelines/tehreem/    @tehreemkamal111
+/docker/tehreem/       @tehreemkamal111
+
+/src/common/           @bereket-DS @FanuelMichael @tehreemkamal111
