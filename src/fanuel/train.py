@@ -110,7 +110,7 @@ def compute_is_holiday(df, stores, holidays):
     real_holidays = holidays[
         holidays["type"].isin(["Holiday", "Additional", "Bridge", "Transfer"]) &
         ~((holidays["type"] == "Holiday") & (holidays["transferred"] == True))
-    ].copy()
+        ].copy()
 
     national_df = real_holidays[real_holidays["locale"] == "National"][["date"]].drop_duplicates()
     national_df["is_national_holiday"] = 1
@@ -123,11 +123,13 @@ def compute_is_holiday(df, stores, holidays):
                 .drop_duplicates().rename(columns={"locale_name": "city"}))
     local_df["is_local_holiday"] = 1
 
+    # Create tmp dataframe
     tmp = df[["date", "store_nbr"]].copy()
-    store_info = tmp["store_nbr"].merge(stores, on="store_nbr", how="left")
-    tmp["city"] = store_info["city"].values
-    tmp["state"] = store_info["state"].values
 
+    # FIX: Merge the DataFrame directly, selecting only the columns we need from stores
+    tmp = tmp.merge(stores[["store_nbr", "city", "state"]], on="store_nbr", how="left")
+
+    # Now merge the holidays
     tmp = tmp.merge(national_df, on="date", how="left")
     tmp = tmp.merge(regional_df, on=["date", "state"], how="left")
     tmp = tmp.merge(local_df, on=["date", "city"], how="left")
