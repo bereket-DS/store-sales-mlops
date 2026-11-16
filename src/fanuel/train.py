@@ -1,3 +1,8 @@
+"""
+Modes:
+    python -m src.fanuel.train              # Runs validation + logs to MLflow
+    python -m src.fanuel.train --submit     # Trains on full data + writes submission.csv
+"""
 
 import argparse
 import subprocess
@@ -8,17 +13,24 @@ import warnings
 from pathlib import Path
 
 import lightgbm as lgb
-import mlflow
 import numpy as np
 import pandas as pd
 import yaml
 from dotenv import load_dotenv
+
+try:
+    import mlflow
+
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
 
 
 # ============================================================
 # 1. FROZEN CONTRACT SETUP
 # ============================================================
 def _find_repo_root() -> Path:
+    """Locates the repository root directory."""
     for candidate in Path(__file__).resolve().parents:
         if (candidate / "src" / "common" / "evaluate.py").exists():
             return candidate
@@ -40,7 +52,7 @@ except ImportError:
 
 
 # ============================================================
-# 2. HELPER FUNCTIONS (Metadata Tracking)
+# 2. METADATA TRACKING
 # ============================================================
 def get_git_info() -> tuple[str, str]:
     """Fetches current git branch and commit SHA for MLflow."""
@@ -51,7 +63,6 @@ def get_git_info() -> tuple[str, str]:
         return branch, sha
     except Exception:
         return "undefined", "undefined"
-
 
 def get_raw_data_md5() -> str:
     """Reads MD5 hash from data/raw.dvc to track data lineage."""
@@ -75,8 +86,7 @@ MLFLOW_EXPERIMENT = "store-sales-fanuel"
 AUTHOR = "fanuel"
 
 LGB_PARAMS = dict(
-    n_estimators=300, learning_rate=0.05, num_leaves=31, random_state=42, verbose=-1
-)
+    n_estimators=300, learning_rate=0.05, num_leaves=31, random_state=42, verbose=-1)
 
 
 # ============================================================
@@ -102,7 +112,7 @@ def load_data():
         if "date" not in df.columns or pd.api.types.is_datetime64_any_dtype(df["date"]):
             return df
 
-        # Robust fallback parser for inconsistent date formats
+        # Fallback date parser
         raw = df["date"].copy()
         for parser in [
             lambda s: pd.to_datetime(s, errors="coerce", dayfirst=False),
@@ -155,6 +165,7 @@ def add_safe_rolling_features(data):
     df = data.sort_values(["store_nbr", "family", "date"]).copy()
     check_lags([HORIZON_DAYS])  # Enforce contract rule
 
+    # Group only by store & family for overall rolling averages
     g = df.groupby(["store_nbr", "family"])[TARGET]
 
     # Shift by 16 days BEFORE rolling to ensure we only use past data
@@ -162,7 +173,8 @@ def add_safe_rolling_features(data):
     df["recent_mean_8w"] = g.transform(lambda s: s.shift(HORIZON_DAYS).rolling(56, min_periods=1).mean())
     df["recent_mean_12w"] = g.transform(lambda s: s.shift(HORIZON_DAYS).rolling(84, min_periods=1).mean())
 
-    gd = df.groupby(["store_nbr", "family", df["date"].dt.dayofweek])[TARGET]
+    # Group by store, family, AND day_of_week for the dow-specific average
+    gd = df.groupby(["store_nbr", "family", df["date"].dt.day_of_week])[TARGET]
     df["recent_mean_dow"] = gd.transform(lambda s: s.shift(HORIZON_DAYS).rolling(4, min_periods=1).mean())
 
     stat_cols = ["recent_mean_4w", "recent_mean_8w", "recent_mean_12w", "recent_mean_dow"]
@@ -186,7 +198,7 @@ def build_features(df, stores, holidays, train_categories=None):
         "year": df["date"].dt.year,
         "month": df["date"].dt.month,
         "day": df["date"].dt.day,
-        "weekday": df["date"].dt.dayofweek,
+        "weekday": df["date"].dt.day_of_week,  # Pandas updated API
     })
 
     for col in ["recent_mean_4w", "recent_mean_8w", "recent_mean_12w", "recent_mean_dow"]:
@@ -199,22 +211,27 @@ def build_features(df, stores, holidays, train_categories=None):
 # ============================================================
 # 6. MLFLOW LOGGING
 # ============================================================
-def log_to_mlflow(score, lgb_params, n_train, n_valid):
-    """Logs params, metrics, and metadata to DagsHub MLflow."""
+def log_to_mlflow(score, lgb_params, n_train, n_valid, model, artifact_path=None):
+    """Logs params, metrics, model, and artifacts to DagsHub MLflow."""
+    if not MLFLOW_AVAILABLE:
+        print("WARNING: mlflow not installed. Skipping logging.")
+        return
+
     branch, sha = get_git_info()
     raw_md5 = get_raw_data_md5()
 
     try:
         mlflow.set_experiment(MLFLOW_EXPERIMENT)
         with mlflow.start_run(run_name=f"lgbm-safe-rolling-{int(time.time())}"):
-            # Metadata
+
+            # Metadata Tags
             mlflow.set_tag("author", AUTHOR)
             mlflow.set_tag("approach", "lgbm_log1p_safe_rolling")
             mlflow.set_tag("git_branch", branch)
             mlflow.set_tag("git_sha", sha)
             mlflow.set_tag("model", "lgbm_safe_rolling")
 
-            # Params
+            # Parameters
             mlflow.log_params(lgb_params)
             mlflow.log_param("window_days", HORIZON_DAYS)
             mlflow.log_param("train_end", str(TRAIN_END.date()))
@@ -226,6 +243,17 @@ def log_to_mlflow(score, lgb_params, n_train, n_valid):
             mlflow.log_metric("rmsle_val", score)
             mlflow.log_metric("n_train_rows", n_train)
             mlflow.log_metric("n_valid_rows", n_valid)
+
+            # Log AND register the model in a single call
+            mlflow.lightgbm.log_model(
+                model,
+                name="lgbm_model",
+                registered_model_name="store-sales-fanuel-lgbm-safe-lags"
+            )
+
+            # Artifacts
+            if artifact_path and Path(artifact_path).exists():
+                mlflow.log_artifact(str(artifact_path))
 
         print(f"MLflow: Logged score {score:.5f} to '{MLFLOW_EXPERIMENT}'")
     except Exception as e:
@@ -255,14 +283,16 @@ def run_validation(train, stores, holidays):
     pred_valid = np.clip(np.expm1(model.predict(X_valid)), 0, None)
     score = rmsle(valid_split[TARGET], pred_valid)
 
-    print(f"\n✅ Validation RMSLE: {score:.5f}")
+    print(f"\nValidation RMSLE: {score:.5f}")
 
-    # Save validation predictions for DVC pipeline and monitoring
+    # Save validation predictions for DVC pipeline
     valid_split["pred_sales"] = pred_valid
     out_path = OUTPUT_DIR / "valid_predictions.parquet"
     valid_split.to_parquet(out_path, index=False)
 
-    log_to_mlflow(score, LGB_PARAMS, len(train_split), len(valid_split))
+    # Log to MLflow
+    drift_plot_path = _REPO_ROOT / "monitoring" / "fanuel" / "distribution_drift.png"
+    log_to_mlflow(score, LGB_PARAMS, len(train_split), len(valid_split), model, drift_plot_path)
 
 
 def run_submission(train, test, stores, holidays):
