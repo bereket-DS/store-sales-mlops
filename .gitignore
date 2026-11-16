@@ -5,6 +5,14 @@ data/raw/*
 data/processed/*/*
 models/*/*
 reports/*/*
+
+# ▼ ADD THESE EXCEPTIONS ▼
+!data/raw/*.dvc
+!data/processed/*/*.dvc
+!models/*/*.dvc
+!reports/*/*.dvc
+# ▲ ADD THESE EXCEPTIONS ▲
+
 !**/.gitkeep
 
 # secrets

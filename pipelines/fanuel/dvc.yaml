@@ -1,0 +1,21 @@
+stages:
+  validate:
+    wdir: ../..
+    cmd: python -m src.fanuel.train
+    deps:
+      - src/fanuel/train.py
+      - src/common/evaluate.py
+      - data/raw
+    outs:
+      - data/processed/fanuel/valid_predictions.parquet:
+          cache: false
+
+  submit:
+    wdir: ../..
+    cmd: python -m src.fanuel.train --submit
+    deps:
+      - src/fanuel/train.py
+      - src/common/evaluate.py
+      - data/raw
+    outs:
+      - data/processed/fanuel/submission.csv

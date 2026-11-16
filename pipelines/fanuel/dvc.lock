@@ -1,0 +1,44 @@
+schema: '2.0'
+stages:
+  validate:
+    cmd: python -m src.fanuel.train
+    deps:
+    - path: data/raw
+      hash: md5
+      md5: 5878614d0a6b1b89c673656451086b88.dir
+      size: 124419555
+      nfiles: 6
+    - path: src/common/evaluate.py
+      hash: md5
+      md5: 9c010a1c1e8f875da7ae96e31843dd70
+      size: 2924
+    - path: src/fanuel/train.py
+      hash: md5
+      md5: 761370065122d9eb804472ea557df4bb
+      size: 13279
+    outs:
+    - path: data/processed/fanuel/valid_predictions.parquet
+      hash: md5
+      md5: 9978981da946dfb268d893e8401d50c3
+      size: 1068952
+  submit:
+    cmd: python -m src.fanuel.train --submit
+    deps:
+    - path: data/raw
+      hash: md5
+      md5: 5878614d0a6b1b89c673656451086b88.dir
+      size: 124419555
+      nfiles: 6
+    - path: src/common/evaluate.py
+      hash: md5
+      md5: 9c010a1c1e8f875da7ae96e31843dd70
+      size: 2924
+    - path: src/fanuel/train.py
+      hash: md5
+      md5: 761370065122d9eb804472ea557df4bb
+      size: 13279
+    outs:
+    - path: data/processed/fanuel/submission.csv
+      hash: md5
+      md5: 0cc6997b60d6b5df1e4a2ffb305f71af
+      size: 771418

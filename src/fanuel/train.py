@@ -256,6 +256,12 @@ def run_validation(train, stores, holidays):
     score = rmsle(valid_split[TARGET], pred_valid)
 
     print(f"\n✅ Validation RMSLE: {score:.5f}")
+
+    # Save validation predictions for DVC pipeline and monitoring
+    valid_split["pred_sales"] = pred_valid
+    out_path = OUTPUT_DIR / "valid_predictions.parquet"
+    valid_split.to_parquet(out_path, index=False)
+
     log_to_mlflow(score, LGB_PARAMS, len(train_split), len(valid_split))
 
 
