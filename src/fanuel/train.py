@@ -1,22 +1,22 @@
-"""
-Modes:
-    python -m src.fanuel.train --validate    # Tests on frozen split + logs to MLflow
-    python -m src.fanuel.train --submit      # Trains on all data + writes submission.csv
-"""
 
 import argparse
+import subprocess
 import sys
 import time
 import traceback
 import warnings
 from pathlib import Path
 
+import lightgbm as lgb
+import mlflow
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
+import yaml
+from dotenv import load_dotenv
+
 
 # ============================================================
-# 1. FROZEN CONTRACT IMPORT SETUP
+# 1. FROZEN CONTRACT SETUP
 # ============================================================
 def _find_repo_root() -> Path:
     for candidate in Path(__file__).resolve().parents:
@@ -24,31 +24,48 @@ def _find_repo_root() -> Path:
             return candidate
     return Path.cwd()
 
+
 _REPO_ROOT = _find_repo_root()
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 try:
     from src.common.evaluate import (
-        HORIZON_DAYS,
-        TARGET,
-        check_lags,
-        rmsle,
-        split_train_valid,
+        HORIZON_DAYS, TARGET, check_lags, rmsle, split_train_valid,
+        TRAIN_END, VALID_START, VALID_END
     )
 except ImportError:
-    print("ERROR: Could not import src.common.evaluate.")
-    print(f"Make sure {_REPO_ROOT}/src/common/evaluate.py exists.")
+    print(f"ERROR: Could not import src.common.evaluate from {_REPO_ROOT}.")
     sys.exit(1)
 
-try:
-    import mlflow
-    MLFLOW_AVAILABLE = True
-except ImportError:
-    MLFLOW_AVAILABLE = False
 
 # ============================================================
-# CONFIGURATION
+# 2. HELPER FUNCTIONS (Metadata Tracking)
+# ============================================================
+def get_git_info() -> tuple[str, str]:
+    """Fetches current git branch and commit SHA for MLflow."""
+    try:
+        branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], stderr=subprocess.DEVNULL,
+                                         text=True).strip()
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
+        return branch, sha
+    except Exception:
+        return "undefined", "undefined"
+
+
+def get_raw_data_md5() -> str:
+    """Reads MD5 hash from data/raw.dvc to track data lineage."""
+    dvc_file = _REPO_ROOT / "data" / "raw.dvc"
+    try:
+        with open(dvc_file, "r") as f:
+            dvc_data = yaml.safe_load(f)
+        return dvc_data["outs"][0]["md5"]
+    except Exception:
+        return "undefined"
+
+
+# ============================================================
+# 3. CONFIGURATION
 # ============================================================
 DATA_DIR = _REPO_ROOT / "data" / "raw"
 OUTPUT_DIR = _REPO_ROOT / "data" / "processed" / "fanuel"
@@ -58,26 +75,26 @@ MLFLOW_EXPERIMENT = "store-sales-fanuel"
 AUTHOR = "fanuel"
 
 LGB_PARAMS = dict(
-    n_estimators=300,
-    learning_rate=0.05,
-    num_leaves=31,
-    random_state=42,
-    verbose=-1,
+    n_estimators=300, learning_rate=0.05, num_leaves=31, random_state=42, verbose=-1
 )
 
+
 # ============================================================
-# DATA LOADING
+# 4. DATA LOADING
 # ============================================================
 def load_data():
+    """Loads CSVs and ensures 'date' columns are parsed correctly."""
     print("Loading data...")
+
     def read(name, **kwargs):
         path = DATA_DIR / name
         if not path.exists():
-            raise FileNotFoundError(f"Missing {path}. Have you run 'dvc pull'?")
+            raise FileNotFoundError(f"Missing {path}. Run 'dvc pull'.")
 
         header_cols = pd.read_csv(path, nrows=0).columns
         if "date" in header_cols:
             kwargs["parse_dates"] = ["date"]
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             df = pd.read_csv(path, **kwargs)
@@ -85,6 +102,7 @@ def load_data():
         if "date" not in df.columns or pd.api.types.is_datetime64_any_dtype(df["date"]):
             return df
 
+        # Robust fallback parser for inconsistent date formats
         raw = df["date"].copy()
         for parser in [
             lambda s: pd.to_datetime(s, errors="coerce", dayfirst=False),
@@ -97,20 +115,18 @@ def load_data():
                 return df
         raise ValueError(f"Could not parse dates for {name}")
 
-    train = read("train.csv")
-    test = read("test.csv")
-    stores = read("stores.csv")
-    holidays = read("holidays_events.csv")
-    return train, test, stores, holidays
+    return read("train.csv"), read("test.csv"), read("stores.csv"), read("holidays_events.csv")
+
 
 # ============================================================
-# FEATURE ENGINEERING
+# 5. FEATURE ENGINEERING
 # ============================================================
 def compute_is_holiday(df, stores, holidays):
+    """Merges national, regional, and local holidays, excluding transferred ones."""
     real_holidays = holidays[
         holidays["type"].isin(["Holiday", "Additional", "Bridge", "Transfer"]) &
         ~((holidays["type"] == "Holiday") & (holidays["transferred"] == True))
-    ].copy()
+        ].copy()
 
     national_df = real_holidays[real_holidays["locale"] == "National"][["date"]].drop_duplicates()
     national_df["is_national_holiday"] = 1
@@ -124,10 +140,7 @@ def compute_is_holiday(df, stores, holidays):
     local_df["is_local_holiday"] = 1
 
     tmp = df[["date", "store_nbr"]].copy()
-    store_info = tmp["store_nbr"].merge(stores, on="store_nbr", how="left")
-    tmp["city"] = store_info["city"].values
-    tmp["state"] = store_info["state"].values
-
+    tmp = tmp.merge(stores[["store_nbr", "city", "state"]], on="store_nbr", how="left")
     tmp = tmp.merge(national_df, on="date", how="left")
     tmp = tmp.merge(regional_df, on=["date", "state"], how="left")
     tmp = tmp.merge(local_df, on=["date", "city"], how="left")
@@ -135,16 +148,16 @@ def compute_is_holiday(df, stores, holidays):
     flags = tmp[["is_national_holiday", "is_regional_holiday", "is_local_holiday"]].fillna(0)
     return (flags.sum(axis=1) > 0).astype(int)
 
+
 def add_safe_rolling_features(data):
+    """Calculates rolling stats shifted by HORIZON_DAYS to prevent leakage."""
     print(f"Calculating rolling features with shift={HORIZON_DAYS} (No Leakage)...")
     df = data.sort_values(["store_nbr", "family", "date"]).copy()
-
-    # Enforce contract rule explicitly
-    check_lags([HORIZON_DAYS])
+    check_lags([HORIZON_DAYS])  # Enforce contract rule
 
     g = df.groupby(["store_nbr", "family"])[TARGET]
 
-    # Shift by exactly the horizon (16 days)
+    # Shift by 16 days BEFORE rolling to ensure we only use past data
     df["recent_mean_4w"] = g.transform(lambda s: s.shift(HORIZON_DAYS).rolling(28, min_periods=1).mean())
     df["recent_mean_8w"] = g.transform(lambda s: s.shift(HORIZON_DAYS).rolling(56, min_periods=1).mean())
     df["recent_mean_12w"] = g.transform(lambda s: s.shift(HORIZON_DAYS).rolling(84, min_periods=1).mean())
@@ -156,7 +169,9 @@ def add_safe_rolling_features(data):
     df[stat_cols] = df[stat_cols].fillna(0)
     return df
 
+
 def build_features(df, stores, holidays, train_categories=None):
+    """Constructs the final feature matrix for LightGBM."""
     if train_categories:
         STORE_DTYPE, FAMILY_DTYPE = train_categories
     else:
@@ -175,59 +190,77 @@ def build_features(df, stores, holidays, train_categories=None):
     })
 
     for col in ["recent_mean_4w", "recent_mean_8w", "recent_mean_12w", "recent_mean_dow"]:
-        if col in df.columns:
-            feat[col] = df[col].values
-        else:
-            feat[col] = 0
+        feat[col] = df[col].values if col in df.columns else 0
 
     feat["is_holiday"] = compute_is_holiday(df, stores, holidays).values
     return feat, train_categories
 
+
 # ============================================================
-# MLFLOW LOGGING
+# 6. MLFLOW LOGGING
 # ============================================================
 def log_to_mlflow(score, lgb_params, n_train, n_valid):
-    if not MLFLOW_AVAILABLE:
-        print("WARNING: mlflow not installed. Skipping logging.")
-        return
+    """Logs params, metrics, and metadata to DagsHub MLflow."""
+    branch, sha = get_git_info()
+    raw_md5 = get_raw_data_md5()
+
     try:
         mlflow.set_experiment(MLFLOW_EXPERIMENT)
         with mlflow.start_run(run_name=f"lgbm-safe-rolling-{int(time.time())}"):
+            # Metadata
             mlflow.set_tag("author", AUTHOR)
-            mlflow.set_tag("approach", "lgbm_log1p_safe_rolling_16d")
+            mlflow.set_tag("approach", "lgbm_log1p_safe_rolling")
+            mlflow.set_tag("git_branch", branch)
+            mlflow.set_tag("git_sha", sha)
+            mlflow.set_tag("model", "lgbm_safe_rolling")
+
+            # Params
             mlflow.log_params(lgb_params)
+            mlflow.log_param("window_days", HORIZON_DAYS)
+            mlflow.log_param("train_end", str(TRAIN_END.date()))
+            mlflow.log_param("valid_start", str(VALID_START.date()))
+            mlflow.log_param("valid_end", str(VALID_END.date()))
+            mlflow.log_param("raw_data_md5", raw_md5)
+
+            # Metrics
             mlflow.log_metric("rmsle_val", score)
             mlflow.log_metric("n_train_rows", n_train)
             mlflow.log_metric("n_valid_rows", n_valid)
-        print(f"      MLflow: Logged score {score:.5f} to '{MLFLOW_EXPERIMENT}'")
+
+        print(f"MLflow: Logged score {score:.5f} to '{MLFLOW_EXPERIMENT}'")
     except Exception as e:
-        print(f"      WARNING: MLflow logging failed: {e}")
+        print(f"WARNING: MLflow logging failed: {e}")
+
 
 # ============================================================
-# MAIN EXECUTION MODES
+# 7. EXECUTION MODES
 # ============================================================
 def run_validation(train, stores, holidays):
+    """Trains on frozen split, evaluates, and logs to MLflow."""
     print("\n--- Starting Validation Mode ---")
     train_rolled = add_safe_rolling_features(train)
-
     train_split, valid_split = split_train_valid(train_rolled)
     print(f"Train rows: {len(train_split):,} | Valid rows: {len(valid_split):,}")
 
+    # Prepare features and log-transform target
     X_train, cats = build_features(train_split, stores, holidays)
     y_train = np.log1p(train_split[TARGET])
     X_valid, _ = build_features(valid_split, stores, holidays, train_categories=cats)
 
-    print(f"Training LightGBM on frozen split...")
+    print("Training LightGBM on frozen split...")
     model = lgb.LGBMRegressor(**LGB_PARAMS)
     model.fit(X_train, y_train, categorical_feature=["store_nbr", "family"])
 
+    # Predict, reverse log1p, and clip negatives
     pred_valid = np.clip(np.expm1(model.predict(X_valid)), 0, None)
     score = rmsle(valid_split[TARGET], pred_valid)
 
     print(f"\n✅ Validation RMSLE: {score:.5f}")
     log_to_mlflow(score, LGB_PARAMS, len(train_split), len(valid_split))
 
+
 def run_submission(train, test, stores, holidays):
+    """Trains on all available data and generates Kaggle submission.csv."""
     print("\n--- Starting Submission Mode ---")
     train_rolled = add_safe_rolling_features(train)
 
@@ -238,7 +271,7 @@ def run_submission(train, test, stores, holidays):
     final_model = lgb.LGBMRegressor(**LGB_PARAMS)
     final_model.fit(X_submit_train, y_submit_train, categorical_feature=["store_nbr", "family"])
 
-    # Get the most recent rolling stats from training data for the test set
+    # Fetch most recent rolling stats for the test set
     latest_stats = train_rolled.groupby(["store_nbr", "family"]).agg(
         recent_mean_4w=("recent_mean_4w", "last"),
         recent_mean_8w=("recent_mean_8w", "last"),
@@ -248,7 +281,6 @@ def run_submission(train, test, stores, holidays):
 
     raw_test = test[["id", "date", "store_nbr", "family", "onpromotion"]].copy()
     test_target = raw_test.merge(latest_stats, on=["store_nbr", "family"], how="left").fillna(0)
-
     X_test, _ = build_features(test_target, stores, holidays, train_categories=cats)
 
     print("Generating predictions...")
@@ -262,7 +294,13 @@ def run_submission(train, test, stores, holidays):
     print(f"Total rows: {len(submission):,}")
     print(f"Mean Sales: {submission['sales'].mean():.2f}")
 
+
+# ============================================================
+# 8. MAIN
+# ============================================================
 def main():
+    load_dotenv()  # Load DagsHub credentials from .env
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--submit", action="store_true", help="Run submission mode")
     args = parser.parse_args()
@@ -276,6 +314,7 @@ def main():
         run_validation(train, stores, holidays)
 
     print(f"\nCompleted in {time.time() - start_time:.1f} seconds.")
+
 
 if __name__ == "__main__":
     try:
