@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  fanuel-model:
+    build:
+      context: ../../
+      dockerfile: docker/fanuel/Dockerfile
+    volumes:
+      - ../../data:/app/data
+      - ../../mlruns:/app/mlruns
+    env_file:
+      - ../../.env
