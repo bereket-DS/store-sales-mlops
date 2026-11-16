@@ -57,8 +57,11 @@ train, valid = split_train_valid(prepared)     # your prepared data
 score = rmsle(valid["sales"], predictions)
 ```
 
-All three members are CODEOWNERS of that file, so changing it needs
-everyone's approval. Treat it as frozen after week one. `pytest` covers it.
+All three members are CODEOWNERS of that file, so GitHub asks all three to
+review any PR that touches it. GitHub does not *enforce* that approval (see
+[Branch protection](#branch-protection-on-main)) - it is a team agreement:
+**do not merge a change to `src/common/` until all three have agreed.** Treat
+it as frozen after week one. `pytest` covers it.
 
 `check_lags()` is there because a lag shorter than 16 days is the easiest way
 to cheat yourself on this competition: it uses data that will not exist at
@@ -98,8 +101,13 @@ python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\act
 pip install -r requirements.txt
 # then install whatever YOUR approach needs: lightgbm, statsmodels, torch, ...
 
-cp .env.example .env
-bash scripts/setup_dvc_remote.sh <DAGSHUB_OWNER> <REPO>
+cp .env.example .env     # then fill in YOUR OWN DagsHub username + token
+
+# The remote URL is already in .dvc/config (committed, same for everyone).
+# Add only your own credentials - they go to .dvc/config.local (gitignored):
+dvc remote modify origin --local auth basic
+dvc remote modify origin --local user <your-dagshub-username>
+dvc remote modify origin --local password <your-dagshub-token>
 
 dvc pull        # identical raw data, no Kaggle account needed
 dvc install     # git hook: auto `dvc checkout` when you switch branches
@@ -108,6 +116,14 @@ pytest          # the shared contract should be green before you start
 
 `dvc install` is worth it. Switching branches changes `dvc.lock` but not the
 files on disk; forget `dvc checkout` once and you train on stale data.
+
+Use **your own** DagsHub token, never a teammate's - it is how DagsHub knows
+who pushed data and logged runs. The repo owner must first add you as a
+collaborator on DagsHub (Settings -> Collaborators, write access).
+
+> `scripts/setup_dvc_remote.sh` was written for DagsHub's S3-style remote;
+> this repo uses the HTTPS remote, so use the three `dvc remote modify`
+> commands above instead.
 
 ### Fill in
 
@@ -128,20 +144,44 @@ dvc push
 
 git add -A && git commit -m "exp: ..., RMSLE 0.4xx"
 git push -u origin exp/<you>/<what>
-# PR into main, one approval from either teammate
+gh pr create --base main      # or open the PR on GitHub
+# merge it yourself when ready: "Create a merge commit"
 ```
+
+Everyone works at their own pace - nobody waits for anybody. `main` simply
+collects each experiment as its PR is merged. Before starting a new branch,
+`git checkout main && git pull` to pick up whatever the others merged so far.
+Because everyone stays in their own folders, a branch being behind `main` is
+harmless.
+
+### Branch protection on `main`
+
+| Setting | Value | Why |
+|---|---|---|
+| Pull request required | yes | every change to `main` is a PR - one PR per experiment, a clear record |
+| Required approvals | **0** | work is independent; merge your own PR without waiting |
+| Force push to `main` | blocked | nobody can rewrite shared history |
+| Delete `main` | blocked | no accidents |
+| Applies to admins | yes | same rules for everyone |
+| Squash merge | disabled (repo setting) | keeps each commit's author |
+
+So `git push` straight to `main` is rejected - push your branch and open a PR.
+Reviews are welcome but optional: comment on a teammate's PR if you spot
+something (a lag < 16 days, not using the shared `rmsle`, a token in the code).
 
 ### Rules
 
-1. **Only touch your own folders.** `src/common/` needs all three approvals.
+1. **Only touch your own folders.** Changes to `src/common/` are merged only
+   after all three agree (team agreement - not enforced by GitHub).
 2. **One `dvc.yaml` per member**, in your own `pipelines/<you>/`. Separate
    files mean separate `dvc.lock` files, which is why three people can commit
    to `main` without merge conflicts. Never put one at the repo root.
 3. **Branch per experiment**, 1-4 days, then merge - including experiments
    that made things worse. A recorded failure is report material.
 4. **Never squash-merge.** It collapses your commits into one authored by
-   whoever merged, which erases individual attribution. Turn it off in
-   Settings -> General -> Pull Requests.
+   whoever merged, which erases individual attribution. It is already
+   turned off in Settings -> General -> Pull Requests; use
+   **Create a merge commit**.
 5. **Never hand-edit `dvc.lock`.** On a conflict, take `main`'s version and
    re-run `dvc repro`.
 6. Check `git config user.email` matches your GitHub account before your first
