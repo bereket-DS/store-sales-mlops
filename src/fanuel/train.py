@@ -1,13 +1,5 @@
-"""
-Fanuel's Day-Specific LightGBM Model with Safe Rolling Features.
-
-Modes:
-    python -m src.fanuel.train              # Runs validation + logs to MLflow
-    python -m src.fanuel.train --submit     # Trains on full data + writes submission.csv
-"""
 
 import argparse
-import os
 import subprocess
 import sys
 import time
