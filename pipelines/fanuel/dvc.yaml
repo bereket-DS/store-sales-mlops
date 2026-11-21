@@ -1,9 +1,11 @@
 stages:
   validate:
     wdir: ../..
-    cmd: python -m src.fanuel.train
+    cmd: python -m src.fanuel.pipeline
     deps:
-      - src/fanuel/train.py
+      - src/fanuel/pipeline.py
+      - src/fanuel/data_loader.py
+      - src/fanuel/feature_engineering.py
       - src/common/evaluate.py
       - data/raw
     outs:
@@ -12,9 +14,11 @@ stages:
 
   submit:
     wdir: ../..
-    cmd: python -m src.fanuel.train --submit
+    cmd: python -m src.fanuel.pipeline --submit
     deps:
-      - src/fanuel/train.py
+      - src/fanuel/pipeline.py
+      - src/fanuel/data_loader.py
+      - src/fanuel/feature_engineering.py
       - src/common/evaluate.py
       - data/raw
     outs:
