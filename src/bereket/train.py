@@ -112,13 +112,38 @@ def fit_predict_lgbm(fit, inner, train, valid, features, args):
     importance = pd.Series(
         final.feature_importance("gain", iteration=rounds), index=features, name="gain"
     ).sort_values(ascending=False)
-    return pred_inner, pred_valid, params_logged, importance
+    return pred_inner, pred_valid, params_logged, importance, final
 
 
+# Every fit_predict_<name>(fit, inner, train, valid, features, args) returns
+# (pred_inner, pred_valid, params, importance or None, final model).
 MODELS = {"lgbm": fit_predict_lgbm}
 
 
 # ---------------------------------------------------------------- helpers
+
+def registered_name(model: str) -> str:
+    """One registry entry per model type; each run adds a new version."""
+    return f"store-sales-bereket-{model}"
+
+
+def log_and_register(model_obj, model: str, input_example: pd.DataFrame) -> None:
+    """Save the final model in the run and register it, using the MLflow
+    flavor that matches the model's library. Add a branch here for each new
+    model family (e.g. statsmodels for ETS)."""
+    import mlflow
+
+    kwargs = {"name": "model", "registered_model_name": registered_name(model),
+              "input_example": input_example}
+    module = type(model_obj).__module__
+    if module.startswith("lightgbm"):
+        mlflow.lightgbm.log_model(model_obj, **kwargs)
+    elif module.startswith("sklearn"):
+        mlflow.sklearn.log_model(model_obj, **kwargs)
+    else:
+        raise TypeError(f"no MLflow flavor wired up for {type(model_obj)} - add one in log_and_register()")
+    log.info("registered model '%s'", registered_name(model))
+
 
 def zero_series(history: pd.DataFrame, days: int) -> pd.DataFrame:
     """store x family with zero sales over the last `days` days of `history`.
@@ -169,6 +194,8 @@ def main() -> None:
     parser.add_argument("--no-refit", action="store_true",
                         help="score validation with the early-stopped model instead of refitting on all of train")
     parser.add_argument("--no-mlflow", action="store_true", help="don't log the run")
+    parser.add_argument("--no-register", action="store_true",
+                        help="log the run but don't save/register the model")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -194,7 +221,7 @@ def main() -> None:
         VALID_START.date(), VALID_END.date(), len(valid),
     )
 
-    pred_inner, pred_valid, model_params, importance = MODELS[args.model](
+    pred_inner, pred_valid, model_params, importance, final_model = MODELS[args.model](
         fit, inner, train, valid, features, args
     )
 
@@ -210,7 +237,8 @@ def main() -> None:
     log.info("RMSLE inner holdout: %.5f", score_inner)
     log.info("RMSLE on validation (%s .. %s): %.5f   [%.1f min]",
              VALID_START.date(), VALID_END.date(), score, minutes)
-    log.info("top features (gain): %s", ", ".join(importance.head(10).index))
+    if importance is not None:
+        log.info("top features (gain): %s", ", ".join(importance.head(10).index))
 
     if args.no_mlflow:
         log.info("--no-mlflow: nothing logged")
@@ -245,8 +273,11 @@ def main() -> None:
         })
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "features.json").write_text(json.dumps(features, indent=2))
-            importance.to_csv(Path(tmp) / "feature_importance.csv")
+            if importance is not None:
+                importance.to_csv(Path(tmp) / "feature_importance.csv")
             mlflow.log_artifacts(tmp)
+        if not args.no_register:
+            log_and_register(final_model, args.model, valid[features].head(5))
         log.info("MLflow run: %s/#/experiments/%s/runs/%s",
                  mlflow.get_tracking_uri(), run.info.experiment_id, run.info.run_id)
 
