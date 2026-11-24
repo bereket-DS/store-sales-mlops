@@ -1,5 +1,16 @@
 # tehreem
 
+## Trained model and MLOps workflow
+
+Use [NEXT_STEPS.md](NEXT_STEPS.md) for the commands to prepare data, train
+LightGBM, log the saved model, generate a Kaggle submission, run the DVC
+pipeline, inspect drift, use Docker, and commit/push your work.
+
+```bash
+dvc repro pipelines/tehreem/dvc.yaml
+python -m src.tehreem.train --log-existing
+```
+
 ## First experiment: a recent weekday baseline
 
 `baseline.py` predicts each store/product-family combination using its average

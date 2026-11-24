@@ -1,0 +1,67 @@
+stages:
+  prepare:
+    wdir: ../..
+    cmd: python -m src.tehreem.prepare
+    deps:
+      - data/raw
+      - src/tehreem/prepare.py
+      - src/tehreem/utils.py
+    outs:
+      - data/processed/tehreem/prepared.parquet
+  train:
+    wdir: ../..
+    cmd: python -m src.tehreem.train --params pipelines/tehreem/params.yaml
+    deps:
+      - data/processed/tehreem/prepared.parquet
+      - src/common/evaluate.py
+      - src/tehreem/prepare.py
+      - src/tehreem/features.py
+      - src/tehreem/train.py
+      - src/tehreem/tracking.py
+      - src/tehreem/utils.py
+      - docker/tehreem/requirements.txt
+    params:
+      - pipelines/tehreem/params.yaml:
+          - features
+          - training
+    outs:
+      - models/tehreem/validation_model.txt
+      - models/tehreem/model_info.json
+      - data/processed/tehreem/lgbm_valid_predictions.parquet
+      - reports/tehreem/feature_importance.csv
+    metrics:
+      - reports/tehreem/metrics.json:
+          cache: true
+  submit:
+    wdir: ../..
+    cmd: python -m src.tehreem.train --submit --params pipelines/tehreem/params.yaml
+    deps:
+      - data/processed/tehreem/prepared.parquet
+      - models/tehreem/model_info.json
+      - src/common/evaluate.py
+      - src/tehreem/features.py
+      - src/tehreem/train.py
+      - src/tehreem/utils.py
+    params:
+      - pipelines/tehreem/params.yaml:
+          - features
+          - training
+    outs:
+      - models/tehreem/submission_model.txt
+      - data/processed/tehreem/submission.csv
+      - reports/tehreem/submission_info.json
+  monitor:
+    wdir: ../..
+    cmd: python -m monitoring.tehreem.drift_report --params pipelines/tehreem/params.yaml
+    deps:
+      - data/processed/tehreem/prepared.parquet
+      - reports/tehreem/metrics.json
+      - src/common/evaluate.py
+      - src/tehreem/utils.py
+      - monitoring/tehreem/drift_report.py
+    params:
+      - pipelines/tehreem/params.yaml:
+          - monitoring
+    outs:
+      - reports/tehreem/drift_report.json
+      - reports/tehreem/drift.png
