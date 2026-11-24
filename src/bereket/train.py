@@ -9,7 +9,9 @@ the scores in MLflow are comparable.
 
 Honest validation: early stopping uses an inner holdout (the last 16 days of
 train, 2017-07-15 .. 07-30), never the validation window itself, so the
-validation score is not tuned on the validation data.
+validation score is not tuned on the validation data. After early stopping
+the model is refit on all of train (fit + inner) with the found number of
+trees; --no-refit skips that.
 """
 
 from __future__ import annotations
@@ -65,7 +67,14 @@ LGBM_PARAMS = {
 }
 
 
-def fit_predict_lgbm(fit, inner, valid, features, args):
+def fit_predict_lgbm(fit, inner, train, valid, features, args):
+    """Early-stop on the inner holdout, then (default) refit on all of train.
+
+    The inner holdout is the 16 days right before validation - the most
+    useful days to learn from. Step 1 uses them only to find the number of
+    trees; step 2 retrains on fit + inner with that many trees (scaled up a
+    little for the extra rows) and predicts validation with that model.
+    """
     import lightgbm as lgb
 
     params = {**LGBM_PARAMS, "learning_rate": args.learning_rate, "num_leaves": args.num_leaves}
@@ -86,12 +95,23 @@ def fit_predict_lgbm(fit, inner, valid, features, args):
     log.info("lgbm: best iteration %d (inner holdout)", best)
 
     pred_inner = np.expm1(booster.predict(inner[features], num_iteration=best))
-    pred_valid = np.expm1(booster.predict(valid[features], num_iteration=best))
-    importance = pd.Series(
-        booster.feature_importance("gain", iteration=best), index=features, name="gain"
-    ).sort_values(ascending=False)
     params_logged = {**params, "num_boost_round": args.num_boost_round,
-                     "early_stopping": args.early_stopping, "best_iteration": best}
+                     "early_stopping": args.early_stopping, "best_iteration": best,
+                     "refit": not args.no_refit}
+
+    if args.no_refit:
+        final, rounds = booster, best
+    else:
+        rounds = int(round(best * len(train) / len(fit)))
+        log.info("lgbm: refit on fit + inner (%d rows) with %d trees", len(train), rounds)
+        dtrain = lgb.Dataset(train[features], np.log1p(train[TARGET]))
+        final = lgb.train(params, dtrain, num_boost_round=rounds)
+        params_logged["refit_rounds"] = rounds
+
+    pred_valid = np.expm1(final.predict(valid[features], num_iteration=rounds))
+    importance = pd.Series(
+        final.feature_importance("gain", iteration=rounds), index=features, name="gain"
+    ).sort_values(ascending=False)
     return pred_inner, pred_valid, params_logged, importance
 
 
@@ -146,6 +166,8 @@ def main() -> None:
     parser.add_argument("--num-leaves", type=int, default=LGBM_PARAMS["num_leaves"])
     parser.add_argument("--num-boost-round", type=int, default=3000)
     parser.add_argument("--early-stopping", type=int, default=100)
+    parser.add_argument("--no-refit", action="store_true",
+                        help="score validation with the early-stopped model instead of refitting on all of train")
     parser.add_argument("--no-mlflow", action="store_true", help="don't log the run")
     args = parser.parse_args()
 
@@ -173,7 +195,7 @@ def main() -> None:
     )
 
     pred_inner, pred_valid, model_params, importance = MODELS[args.model](
-        fit, inner, valid, features, args
+        fit, inner, train, valid, features, args
     )
 
     # zero rule: decided from data before each window only
@@ -197,7 +219,7 @@ def main() -> None:
     import mlflow
 
     mlflow.set_experiment(EXPERIMENT)
-    with mlflow.start_run(run_name=f"{args.model}-features-v1") as run:
+    with mlflow.start_run(run_name=f"{args.model}-features-v2") as run:
         mlflow.set_tags({
             "author": "bereket",
             "model": args.model,
