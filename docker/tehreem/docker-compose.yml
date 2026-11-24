@@ -1,0 +1,20 @@
+services:
+  train:
+    image: store-sales-tehreem:local
+    build:
+      context: .
+    user: "${TEHREEM_UID:-1000}:${TEHREEM_GID:-1000}"
+    cpus: 4
+    mem_limit: 6g
+    working_dir: /app
+    env_file:
+      - ../../.env
+    environment:
+      OMP_NUM_THREADS: '4'
+      PYTHONUNBUFFERED: '1'
+      XDG_CACHE_HOME: /tmp/tehreem-cache
+    volumes:
+      - ../..:/app:ro
+      - ../../data/processed/tehreem:/app/data/processed/tehreem
+      - ../../models/tehreem:/app/models/tehreem
+      - ../../reports/tehreem:/app/reports/tehreem

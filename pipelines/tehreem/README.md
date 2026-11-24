@@ -1,4 +1,14 @@
 # tehreem - pipelines
 
-Your dvc.yaml and params.yaml go here.
-A separate file per member means a separate dvc.lock, so no merge conflicts.
+From the repository root:
+
+```bash
+dvc repro pipelines/tehreem/dvc.yaml
+dvc push pipelines/tehreem/dvc.yaml
+```
+
+Stages: `prepare` -> `train` -> `submit`, with `monitor` using the prepared
+inputs and validation metrics. Parameters live in `params.yaml`; DVC generates
+`dvc.lock`. Prepared data is narrow, and lag/rolling features stay in memory.
+
+See [the full command guide](../../src/tehreem/NEXT_STEPS.md).

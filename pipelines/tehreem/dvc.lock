@@ -1,0 +1,232 @@
+schema: '2.0'
+stages:
+  prepare:
+    cmd: python -m src.tehreem.prepare
+    deps:
+    - path: data/raw
+      hash: md5
+      md5: 53330c0085ee4d351c56e940dc13efef.dir
+      size: 124761708
+      nfiles: 7
+    - path: src/tehreem/prepare.py
+      hash: md5
+      md5: ac24bad97c60586dba25eb864f770d86
+      size: 3316
+    - path: src/tehreem/utils.py
+      hash: md5
+      md5: 3921121497c628414f8c6d38e4351345
+      size: 2109
+    outs:
+    - path: data/processed/tehreem/prepared.parquet
+      hash: md5
+      md5: 6152d8f4e303a9d8955a67d4345879f9
+      size: 22333167
+  train:
+    cmd: python -m src.tehreem.train --params pipelines/tehreem/params.yaml
+    deps:
+    - path: data/processed/tehreem/prepared.parquet
+      hash: md5
+      md5: 6152d8f4e303a9d8955a67d4345879f9
+      size: 22333167
+    - path: docker/tehreem/requirements.txt
+      hash: md5
+      md5: ba89e92a8b5562b66e41d9c9107b4565
+      size: 121
+    - path: src/common/evaluate.py
+      hash: md5
+      md5: e6d5cc12d48afaeca44db42b6efdf1c7
+      size: 2839
+    - path: src/tehreem/features.py
+      hash: md5
+      md5: 993ed339221e6e968efc2990b8b421e6
+      size: 3543
+    - path: src/tehreem/prepare.py
+      hash: md5
+      md5: ac24bad97c60586dba25eb864f770d86
+      size: 3316
+    - path: src/tehreem/tracking.py
+      hash: md5
+      md5: c2d632251cc882d5009e344380f5bc69
+      size: 3014
+    - path: src/tehreem/train.py
+      hash: md5
+      md5: a56c5d3fa8175c9061a7691c6f1c7812
+      size: 8154
+    - path: src/tehreem/utils.py
+      hash: md5
+      md5: 3921121497c628414f8c6d38e4351345
+      size: 2109
+    params:
+      pipelines/tehreem/params.yaml:
+        features:
+          lags:
+          - 16
+          - 21
+          - 28
+          - 35
+          - 56
+          - 364
+          rolling_windows:
+          - 7
+          - 28
+          - 56
+          rolling_shift: 16
+          weekday_shift_weeks: 3
+          weekday_window_weeks: 8
+        training:
+          start_date: '2016-01-01'
+          inner_days: 16
+          max_rounds: 1000
+          early_stopping_rounds: 60
+          zero_history_days: 56
+          lightgbm:
+            objective: regression
+            metric: rmse
+            learning_rate: 0.05
+            num_leaves: 63
+            min_data_in_leaf: 100
+            max_bin: 127
+            feature_fraction: 0.9
+            lambda_l2: 1.0
+            num_threads: 4
+            deterministic: true
+            force_col_wise: true
+            seed: 42
+            verbosity: -1
+    outs:
+    - path: data/processed/tehreem/lgbm_valid_predictions.parquet
+      hash: md5
+      md5: c35486aa92bb9af87fe006a7cca93738
+      size: 520906
+    - path: models/tehreem/model_info.json
+      hash: md5
+      md5: 79d7163acecad4f6aa331515dfa0ca27
+      size: 1959
+    - path: models/tehreem/validation_model.txt
+      hash: md5
+      md5: 91386bec7a92aac6944751047e87bc6d
+      size: 6000511
+    - path: reports/tehreem/feature_importance.csv
+      hash: md5
+      md5: 1f8d94fa0214d28293b0e109e5f24540
+      size: 905
+    - path: reports/tehreem/metrics.json
+      hash: md5
+      md5: a9e8d6b7f093cff7d21ec41ac57e7579
+      size: 188
+  submit:
+    cmd: python -m src.tehreem.train --submit --params 
+      pipelines/tehreem/params.yaml
+    deps:
+    - path: data/processed/tehreem/prepared.parquet
+      hash: md5
+      md5: 6152d8f4e303a9d8955a67d4345879f9
+      size: 22333167
+    - path: models/tehreem/model_info.json
+      hash: md5
+      md5: 79d7163acecad4f6aa331515dfa0ca27
+      size: 1959
+    - path: src/common/evaluate.py
+      hash: md5
+      md5: e6d5cc12d48afaeca44db42b6efdf1c7
+      size: 2839
+    - path: src/tehreem/features.py
+      hash: md5
+      md5: 993ed339221e6e968efc2990b8b421e6
+      size: 3543
+    - path: src/tehreem/train.py
+      hash: md5
+      md5: a56c5d3fa8175c9061a7691c6f1c7812
+      size: 8154
+    - path: src/tehreem/utils.py
+      hash: md5
+      md5: 3921121497c628414f8c6d38e4351345
+      size: 2109
+    params:
+      pipelines/tehreem/params.yaml:
+        features:
+          lags:
+          - 16
+          - 21
+          - 28
+          - 35
+          - 56
+          - 364
+          rolling_windows:
+          - 7
+          - 28
+          - 56
+          rolling_shift: 16
+          weekday_shift_weeks: 3
+          weekday_window_weeks: 8
+        training:
+          start_date: '2016-01-01'
+          inner_days: 16
+          max_rounds: 1000
+          early_stopping_rounds: 60
+          zero_history_days: 56
+          lightgbm:
+            objective: regression
+            metric: rmse
+            learning_rate: 0.05
+            num_leaves: 63
+            min_data_in_leaf: 100
+            max_bin: 127
+            feature_fraction: 0.9
+            lambda_l2: 1.0
+            num_threads: 4
+            deterministic: true
+            force_col_wise: true
+            seed: 42
+            verbosity: -1
+    outs:
+    - path: data/processed/tehreem/submission.csv
+      hash: md5
+      md5: ecc9bcf0f0678e40b06ca5441e2415f5
+      size: 730982
+    - path: models/tehreem/submission_model.txt
+      hash: md5
+      md5: 313c4135e605d72f1950dce24bfa1480
+      size: 6002115
+    - path: reports/tehreem/submission_info.json
+      hash: md5
+      md5: b80c7d18ee16123cba250a9a8c2a721b
+      size: 379
+  monitor:
+    cmd: python -m monitoring.tehreem.drift_report --params 
+      pipelines/tehreem/params.yaml
+    deps:
+    - path: data/processed/tehreem/prepared.parquet
+      hash: md5
+      md5: 6152d8f4e303a9d8955a67d4345879f9
+      size: 22333167
+    - path: monitoring/tehreem/drift_report.py
+      hash: md5
+      md5: 8d56d7387f05f91941a0aedb103b2588
+      size: 3792
+    - path: reports/tehreem/metrics.json
+      hash: md5
+      md5: a9e8d6b7f093cff7d21ec41ac57e7579
+      size: 188
+    - path: src/common/evaluate.py
+      hash: md5
+      md5: e6d5cc12d48afaeca44db42b6efdf1c7
+      size: 2839
+    - path: src/tehreem/utils.py
+      hash: md5
+      md5: 3921121497c628414f8c6d38e4351345
+      size: 2109
+    params:
+      pipelines/tehreem/params.yaml:
+        monitoring:
+          reference_days: 56
+          bins: 10
+    outs:
+    - path: reports/tehreem/drift.png
+      hash: md5
+      md5: a8b118bc1dbaf234dd9136d85f4ace42
+      size: 29126
+    - path: reports/tehreem/drift_report.json
+      hash: md5
+      md5: a4528ea6accb36860ac657ac26933332
+      size: 617

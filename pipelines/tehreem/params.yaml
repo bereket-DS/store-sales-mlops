@@ -1,0 +1,29 @@
+features:
+  lags: [16, 21, 28, 35, 56, 364]
+  rolling_windows: [7, 28, 56]
+  rolling_shift: 16
+  weekday_shift_weeks: 3
+  weekday_window_weeks: 8
+training:
+  start_date: '2016-01-01'
+  inner_days: 16
+  max_rounds: 1000
+  early_stopping_rounds: 60
+  zero_history_days: 56
+  lightgbm:
+    objective: regression
+    metric: rmse
+    learning_rate: 0.05
+    num_leaves: 63
+    min_data_in_leaf: 100
+    max_bin: 127
+    feature_fraction: 0.9
+    lambda_l2: 1.0
+    num_threads: 4
+    deterministic: true
+    force_col_wise: true
+    seed: 42
+    verbosity: -1
+monitoring:
+  reference_days: 56
+  bins: 10
