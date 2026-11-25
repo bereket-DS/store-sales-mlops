@@ -1,6 +1,6 @@
 """
 Main ML pipeline for Fanuel's model.
-Orchestrates training, MLflow logging, and Kaggle submission generation.
+Orchestrates training, MLflow logging
 
 Modes:
     python -m src.fanuel.pipeline              # Runs validation + logs to MLflow
@@ -12,6 +12,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+import joblib
 
 import lightgbm as lgb
 import numpy as np
@@ -143,12 +144,17 @@ def run_submission(train, test, stores, holidays):
 
     print("Generating predictions...")
     test_pred = np.clip(np.expm1(final_model.predict(X_test)), 0, None)
+    model_dir = _REPO_ROOT / "models" / "fanuel"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model_path = model_dir / "lgbm_model.pkl"
+    joblib.dump(final_model, str(model_path))
+    print(f"Model saved to {model_path}")
 
     submission = pd.DataFrame({"id": test["id"], "sales": test_pred})
     out_path = OUTPUT_DIR / "submission.csv"
     submission.to_csv(out_path, index=False)
 
-    print(f"\n✅ SUCCESS! Saved to {out_path.resolve()}")
+    print(f"\nSuccessfully Saved to {out_path.resolve()}")
     print(f"Total rows: {len(submission):,}")
     print(f"Mean Sales: {submission['sales'].mean():.2f}")
 
