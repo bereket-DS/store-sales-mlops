@@ -21,6 +21,7 @@ import logging
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from src.common.evaluate import MIN_LAG, TARGET, check_lags, split_train_valid
@@ -31,6 +32,8 @@ KEYS = ["store_nbr", "family"]
 # Defaults - an experiment can pass its own.
 SALES_LAGS = [16, 21, 28, 35, 364]          # 364 = same weekday, one year back
 ROLL_WINDOWS = [7, 14, 28, 56]              # means over the w days ending MIN_LAG ago
+LOG_ROLL_WINDOWS = [7, 14, 28, 56, 112]     # same, on log1p(sales)
+EWM_ALPHAS = [0.1, 0.3]                     # exponentially weighted means of log1p(sales)
 TRANSACTION_LAGS = [16, 28]
 
 CATEGORICAL = ["store_nbr", "family", "city", "state", "store_type", "cluster"]
@@ -114,6 +117,46 @@ def add_lags(
     return df
 
 
+def add_log_history(df: pd.DataFrame, roll_windows: list[int]) -> pd.DataFrame:
+    """Rolling stats on log1p(sales) - the scale the model is trained on.
+
+    A mean of raw sales is pulled up by a few huge days; a mean of log sales
+    matches what RMSLE cares about. Same rule as add_lags: every window ends
+    MIN_LAG days back.
+    """
+    keys = [df[k] for k in KEYS]
+    base = np.log1p(df[TARGET]).groupby(keys, observed=True).shift(MIN_LAG)
+    base_g = base.groupby(keys, observed=True)
+    for w in roll_windows:
+        df[f"log_roll_mean_{w}"] = base_g.transform(lambda s, w=w: s.rolling(w, min_periods=1).mean())
+    df["log_roll_std_28"] = base_g.transform(lambda s: s.rolling(28, min_periods=2).std())
+    for alpha in EWM_ALPHAS:
+        df[f"log_ewm_{alpha}"] = base_g.transform(lambda s, a=alpha: s.ewm(alpha=a).mean())
+    # share of zero-sales days (filler days count as unknown, not as zero)
+    is_zero = base.eq(0).where(base.notna())
+    df["zero_frac_56"] = is_zero.groupby(keys, observed=True).transform(
+        lambda s: s.rolling(56, min_periods=1).mean()
+    )
+    return df
+
+
+def add_promo(df: pd.DataFrame) -> pd.DataFrame:
+    """Promotion context. `onpromotion` is known in advance (it is in test.csv),
+    so the current day, past days AND the next days may be used.
+    """
+    keys = [df[k] for k in KEYS]
+    promo = df["onpromotion"].astype("float64")
+    pg = promo.groupby(keys, observed=True)
+    df["promo_roll_mean_14"] = pg.transform(lambda s: s.rolling(14, min_periods=1).mean())
+    df["promo_lead_mean_7"] = pg.transform(lambda s: s[::-1].rolling(7, min_periods=1).mean()[::-1])
+    # promotions now vs. the period the sales lags come from
+    past = pg.shift(MIN_LAG).groupby(keys, observed=True).transform(
+        lambda s: s.rolling(28, min_periods=1).mean()
+    )
+    df["promo_vs_past_28"] = promo - past
+    return df
+
+
 def build_features(
     df: pd.DataFrame,
     sales_lags: list[int] | None = None,
@@ -134,6 +177,8 @@ def build_features(
     df = _complete_calendar(df)
     df = df.sort_values([*KEYS, "date"], ignore_index=True)
     df = add_lags(df, sales_lags, roll_windows, transaction_lags)
+    df = add_log_history(df, LOG_ROLL_WINDOWS)
+    df = add_promo(df)
     df = df.loc[~df.pop("_filler")].reset_index(drop=True)
     df = add_calendar(df)
 
@@ -143,8 +188,10 @@ def build_features(
         df[col] = df[col].astype("category")
 
     lag_cols = [c for c in df.columns if c.startswith(("sales_lag_", "sales_roll_", "transactions_lag_"))]
+    log_cols = [c for c in df.columns if c.startswith(("log_roll_", "log_ewm_"))] + ["zero_frac_56"]
+    promo_cols = ["promo_roll_mean_14", "promo_lead_mean_7", "promo_vs_past_28"]
     calendar_cols = ["day_of_week", "day_of_month", "month", "year", "is_payday"]
-    features = CATEGORICAL + KNOWN_IN_ADVANCE + FLAGS + calendar_cols + lag_cols
+    features = CATEGORICAL + KNOWN_IN_ADVANCE + FLAGS + calendar_cols + lag_cols + log_cols + promo_cols
 
     log.info(
         "built %d features for %d rows in %.1fs", len(features), len(df), time.perf_counter() - start
