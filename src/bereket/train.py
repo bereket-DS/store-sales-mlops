@@ -6,6 +6,7 @@ the scores in MLflow are comparable.
 
     python -m src.bereket.train --model lgbm
     python -m src.bereket.train --model ridge
+    python -m src.bereket.train --model ets
     python -m src.bereket.train --model lgbm --no-mlflow     # quick check, nothing logged
 
 Honest validation: early stopping uses an inner holdout (the last 16 days of
@@ -208,9 +209,106 @@ def fit_predict_ridge(fit, inner, train, valid, features, args):
     return pred_inner, pred_valid, params, importance, final
 
 
+# ETS (Holt-Winters): one small model per store x family, on that series'
+# own past only - no features, no promotions, no holidays. A different kind
+# of model from the two above, which is what an ensemble needs.
+ETS_SEASON = 7          # weekly pattern
+ETS_MIN_DAYS = 4 * ETS_SEASON
+
+
+def ets_history(history: pd.DataFrame, days: int) -> pd.DataFrame:
+    """date x (store_nbr, family) table of log1p(sales), one row per day.
+
+    Holt-Winters needs an unbroken daily series. Dec 25 (stores closed, no
+    row) is filled with the same weekday one week earlier.
+    """
+    start = history["date"].max() - pd.Timedelta(days=days - 1)
+    recent = history.loc[history["date"] >= start, ["date", *KEYS, TARGET]]
+    recent = recent.astype({"store_nbr": "int64", "family": "str"})
+    wide = recent.pivot(index="date", columns=KEYS, values=TARGET)
+    wide = wide.reindex(pd.date_range(wide.index.min(), wide.index.max(), freq="D"))
+    wide = wide.fillna(wide.shift(ETS_SEASON)).fillna(wide.shift(-ETS_SEASON)).fillna(0.0)
+    return np.log1p(wide)
+
+
+def ets_forecast_one(y: np.ndarray, steps: int, trend: str | None) -> tuple[np.ndarray, bool]:
+    """Holt-Winters forecast for one series; (forecast, used_fallback).
+
+    Leading zeros (before a store sold this family) are cut off. Series that
+    are too short, flat, or fail to fit get the mean of their last 4 weeks.
+    """
+    import warnings
+
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+    nonzero = np.flatnonzero(y > 0)
+    if len(nonzero) == 0:
+        return np.zeros(steps), False
+    y = y[nonzero[0]:]
+    fallback = np.full(steps, y[-ETS_MIN_DAYS:].mean())
+    if len(y) < ETS_MIN_DAYS or np.ptp(y[-ETS_MIN_DAYS:]) == 0:
+        return fallback, True
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")    # convergence chatter, 1782 times
+            fitted = ExponentialSmoothing(
+                y, trend=trend, damped_trend=trend is not None, seasonal="add",
+                seasonal_periods=ETS_SEASON, initialization_method="estimated",
+            ).fit()
+        forecast = fitted.forecast(steps)
+    except (ValueError, np.linalg.LinAlgError):
+        return fallback, True
+    if not np.isfinite(forecast).all():
+        return fallback, True
+    return forecast, False
+
+
+def ets_predict(history: pd.DataFrame, target: pd.DataFrame, args) -> tuple[np.ndarray, int]:
+    """Forecast every series from the end of `history` to the rows of `target`.
+
+    Returns (sales predictions aligned with `target`, number of fallbacks).
+    """
+    from joblib import Parallel, delayed, parallel_config
+
+    wide = ets_history(history, args.ets_days)
+    dates = pd.date_range(wide.index.max() + pd.Timedelta(days=1), target["date"].max(), freq="D")
+    trend = None if args.ets_trend == "none" else args.ets_trend
+    with parallel_config(backend="loky", inner_max_num_threads=1):   # 1 BLAS thread per worker
+        results = Parallel(n_jobs=-1, batch_size=16)(
+            delayed(ets_forecast_one)(wide[col].to_numpy(), len(dates), trend) for col in wide.columns
+        )
+    series = wide.columns.to_frame(index=False)
+    long = pd.DataFrame({
+        "date": np.tile(dates, len(series)),
+        "store_nbr": np.repeat(series["store_nbr"].to_numpy(), len(dates)),
+        "family": np.repeat(series["family"].to_numpy(), len(dates)),
+        "pred": np.concatenate([forecast for forecast, _ in results]),
+    })
+    keys = target[["date", *KEYS]].astype({"store_nbr": "int64", "family": "str"})
+    pred = keys.merge(long, on=["date", *KEYS], how="left")["pred"]
+    if pred.isna().any():
+        log.warning("ets: %d target rows have no history - predicting 0", int(pred.isna().sum()))
+    return np.expm1(pred.fillna(0.0).to_numpy()), sum(used for _, used in results)
+
+
+def fit_predict_ets(fit, inner, train, valid, features, args):
+    """Inner: forecast from the end of `fit`. Validation: from the end of all
+    of train. ETS always "refits" - a forecast starts where its data ends -
+    so --no-refit does not apply. There is no single model object to save
+    (1782 small ones), so nothing is registered."""
+    pred_inner, fallback_inner = ets_predict(fit, inner, args)
+    log.info("ets: inner done (%d fallback series)", fallback_inner)
+    pred_valid, fallback_valid = ets_predict(train, valid, args)
+    log.info("ets: validation done (%d fallback series)", fallback_valid)
+    params = {"ets_trend": args.ets_trend, "ets_damped": args.ets_trend != "none",
+              "ets_seasonal": "add", "ets_season": ETS_SEASON, "ets_days": args.ets_days,
+              "ets_target": "log1p", "n_fallback_valid": fallback_valid}
+    return pred_inner, pred_valid, params, None, None
+
+
 # Every fit_predict_<name>(fit, inner, train, valid, features, args) returns
-# (pred_inner, pred_valid, params, importance or None, final model).
-MODELS = {"lgbm": fit_predict_lgbm, "ridge": fit_predict_ridge}
+# (pred_inner, pred_valid, params, importance or None, final model or None).
+MODELS = {"lgbm": fit_predict_lgbm, "ridge": fit_predict_ridge, "ets": fit_predict_ets}
 
 
 # ---------------------------------------------------------------- helpers
@@ -287,6 +385,10 @@ def main() -> None:
     parser.add_argument("--alphas", type=lambda s: [float(a) for a in s.split(",")],
                         default=[1e3, 3e3, 1e4, 3e4, 1e5, 3e5],
                         help="ridge: comma-separated alphas to try on the inner holdout")
+    parser.add_argument("--ets-days", type=int, default=728,
+                        help="ets: fit each series on its last N days")
+    parser.add_argument("--ets-trend", choices=["add", "none"], default="add",
+                        help="ets: damped additive trend, or no trend")
     parser.add_argument("--no-refit", action="store_true",
                         help="score validation with the early-stopped model instead of refitting on all of train")
     parser.add_argument("--no-mlflow", action="store_true", help="don't log the run")
@@ -372,7 +474,11 @@ def main() -> None:
             if importance is not None:
                 importance.to_csv(Path(tmp) / "feature_importance.csv")
             mlflow.log_artifacts(tmp)
-        if not args.no_register:
+        if args.no_register:
+            log.info("--no-register: model not saved/registered")
+        elif final_model is None:
+            log.info("%s has no single model object to save - nothing registered", args.model)
+        else:
             log_and_register(final_model, args.model, valid[features].head(5))
         log.info("MLflow run: %s/#/experiments/%s/runs/%s",
                  mlflow.get_tracking_uri(), run.info.experiment_id, run.info.run_id)
