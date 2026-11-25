@@ -5,6 +5,7 @@ same data, the same split (src/common/evaluate.py) and the same metric, so
 the scores in MLflow are comparable.
 
     python -m src.bereket.train --model lgbm
+    python -m src.bereket.train --model ridge
     python -m src.bereket.train --model lgbm --no-mlflow     # quick check, nothing logged
 
 Honest validation: early stopping uses an inner holdout (the last 16 days of
@@ -115,9 +116,101 @@ def fit_predict_lgbm(fit, inner, train, valid, features, args):
     return pred_inner, pred_valid, params_logged, importance, final
 
 
+# Ridge: a linear model needs what trees don't - numbers for categories,
+# no missing values, one scale for all columns. All of that lives inside one
+# sklearn Pipeline, so the registered model takes the same raw feature frame
+# as LightGBM does.
+RIDGE_ONE_HOT_EXTRA = ["day_of_week", "month"]          # ints, but not "more is more"
+RIDGE_LOG_PREFIXES = ("sales_lag_", "sales_roll_", "transactions_lag_")
+RIDGE_LOG_EXTRA = ["onpromotion", "promo_roll_mean_14", "promo_lead_mean_7"]
+# A linear model gives "August" one weight for every family. School supplies
+# jump in August (back to school) and nothing else does - so each family
+# gets its own month and weekday columns.
+RIDGE_CROSSES = [("family", "month"), ("family", "day_of_week")]
+
+
+def ridge_crosses(X: pd.DataFrame) -> pd.DataFrame:
+    """family x month, family x day_of_week as text categories, for one-hot."""
+    return pd.DataFrame({f"{a}_x_{b}": X[a].astype(str) + "|" + X[b].astype(str)
+                         for a, b in RIDGE_CROSSES}, index=X.index)
+
+
+def ridge_cross_names(transformer, input_features):
+    return np.array([f"{a}_x_{b}" for a, b in RIDGE_CROSSES], dtype=object)
+
+
+def ridge_pipeline(features: list[str], alpha: float):
+    """one-hot categoricals + crosses | log1p skewed counts | impute | scale -> Ridge.
+
+    log1p because the target is log1p(sales): a linear model on log sales
+    should see log history, not raw history. Missing lags (the first days
+    of a series) get the median plus a 0/1 "was missing" column.
+    """
+    from sklearn.compose import ColumnTransformer
+    from sklearn.impute import SimpleImputer
+    from sklearn.linear_model import Ridge
+    from sklearn.pipeline import Pipeline, make_pipeline
+    from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
+
+    from src.bereket.features import CATEGORICAL
+
+    one_hot = [c for c in CATEGORICAL + RIDGE_ONE_HOT_EXTRA if c in features]
+    crossed = sorted({c for pair in RIDGE_CROSSES for c in pair})
+    logged = [c for c in features if c.startswith(RIDGE_LOG_PREFIXES) or c in RIDGE_LOG_EXTRA]
+    plain = [c for c in features if c not in one_hot and c not in logged]
+
+    def numeric(*steps):
+        return make_pipeline(*steps, SimpleImputer(strategy="median", add_indicator=True),
+                             StandardScaler())
+
+    def onehot():
+        return OneHotEncoder(handle_unknown="ignore", dtype=np.float32)
+
+    prep = ColumnTransformer(
+        [
+            ("onehot", onehot(), one_hot),
+            ("cross", make_pipeline(FunctionTransformer(ridge_crosses, feature_names_out=ridge_cross_names), onehot()), crossed),
+            ("log", numeric(FunctionTransformer(np.log1p, feature_names_out="one-to-one")), logged),
+            ("num", numeric(), plain),
+        ],
+        sparse_threshold=1.0,       # sparse: ~900 columns, mostly one-hot zeros
+    )
+    return Pipeline([("prep", prep), ("ridge", Ridge(alpha=alpha))])
+
+
+def fit_predict_ridge(fit, inner, train, valid, features, args):
+    """Pick alpha on the inner holdout, then (default) refit on all of train."""
+    y_fit = np.log1p(fit[TARGET])
+    best_alpha, best_score, best_model = None, np.inf, None
+    for alpha in args.alphas:
+        model = ridge_pipeline(features, alpha).fit(fit[features], y_fit)
+        score = rmsle(inner[TARGET], np.expm1(model.predict(inner[features])).clip(0))
+        log.info("ridge: alpha %-8g inner RMSLE %.5f", alpha, score)
+        if score < best_score:
+            best_alpha, best_score, best_model = alpha, score, model
+    log.info("ridge: best alpha %g (inner holdout)", best_alpha)
+
+    pred_inner = np.expm1(best_model.predict(inner[features]))
+    if args.no_refit:
+        final = best_model
+    else:
+        log.info("ridge: refit on fit + inner (%d rows)", len(train))
+        final = ridge_pipeline(features, best_alpha).fit(train[features], np.log1p(train[TARGET]))
+    pred_valid = np.expm1(final.predict(valid[features]))
+
+    # "importance" for a linear model: size of the coefficient on the scaled
+    # inputs (one-hot columns are 0/1, the rest have std 1, so they compare).
+    names = final.named_steps["prep"].get_feature_names_out()
+    importance = pd.Series(np.abs(final.named_steps["ridge"].coef_), index=names,
+                           name="abs_coef").sort_values(ascending=False)
+    params = {"alpha": best_alpha, "alphas_tried": ",".join(map(str, args.alphas)),
+              "refit": not args.no_refit, "n_inputs_after_prep": len(names)}
+    return pred_inner, pred_valid, params, importance, final
+
+
 # Every fit_predict_<name>(fit, inner, train, valid, features, args) returns
 # (pred_inner, pred_valid, params, importance or None, final model).
-MODELS = {"lgbm": fit_predict_lgbm}
+MODELS = {"lgbm": fit_predict_lgbm, "ridge": fit_predict_ridge}
 
 
 # ---------------------------------------------------------------- helpers
@@ -191,6 +284,9 @@ def main() -> None:
     parser.add_argument("--num-leaves", type=int, default=LGBM_PARAMS["num_leaves"])
     parser.add_argument("--num-boost-round", type=int, default=3000)
     parser.add_argument("--early-stopping", type=int, default=100)
+    parser.add_argument("--alphas", type=lambda s: [float(a) for a in s.split(",")],
+                        default=[1e3, 3e3, 1e4, 3e4, 1e5, 3e5],
+                        help="ridge: comma-separated alphas to try on the inner holdout")
     parser.add_argument("--no-refit", action="store_true",
                         help="score validation with the early-stopped model instead of refitting on all of train")
     parser.add_argument("--no-mlflow", action="store_true", help="don't log the run")
@@ -238,7 +334,7 @@ def main() -> None:
     log.info("RMSLE on validation (%s .. %s): %.5f   [%.1f min]",
              VALID_START.date(), VALID_END.date(), score, minutes)
     if importance is not None:
-        log.info("top features (gain): %s", ", ".join(importance.head(10).index))
+        log.info("top features (%s): %s", importance.name, ", ".join(importance.head(10).index))
 
     if args.no_mlflow:
         log.info("--no-mlflow: nothing logged")
