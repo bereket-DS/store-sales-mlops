@@ -1,7 +1,7 @@
 schema: '2.0'
 stages:
   validate:
-    cmd: python -m src.fanuel.train
+    cmd: python -m src.fanuel.pipeline
     deps:
     - path: data/raw
       hash: md5
@@ -12,17 +12,25 @@ stages:
       hash: md5
       md5: 9c010a1c1e8f875da7ae96e31843dd70
       size: 2924
-    - path: src/fanuel/train.py
+    - path: src/fanuel/data_loader.py
       hash: md5
-      md5: 761370065122d9eb804472ea557df4bb
-      size: 13279
+      md5: ba402b9fd68299d305a5b1fc0cdc3301
+      size: 3995
+    - path: src/fanuel/feature_engineering.py
+      hash: md5
+      md5: 8a1aac6a59c6344a5812b436c3f1b1b3
+      size: 3963
+    - path: src/fanuel/pipeline.py
+      hash: md5
+      md5: 0397275d00c6ea7eedfd1e2027554745
+      size: 7119
     outs:
     - path: data/processed/fanuel/valid_predictions.parquet
       hash: md5
       md5: 9978981da946dfb268d893e8401d50c3
       size: 1068952
   submit:
-    cmd: python -m src.fanuel.train --submit
+    cmd: python -m src.fanuel.pipeline --submit
     deps:
     - path: data/raw
       hash: md5
@@ -33,10 +41,18 @@ stages:
       hash: md5
       md5: 9c010a1c1e8f875da7ae96e31843dd70
       size: 2924
-    - path: src/fanuel/train.py
+    - path: src/fanuel/data_loader.py
       hash: md5
-      md5: 761370065122d9eb804472ea557df4bb
-      size: 13279
+      md5: ba402b9fd68299d305a5b1fc0cdc3301
+      size: 3995
+    - path: src/fanuel/feature_engineering.py
+      hash: md5
+      md5: 8a1aac6a59c6344a5812b436c3f1b1b3
+      size: 3963
+    - path: src/fanuel/pipeline.py
+      hash: md5
+      md5: 0397275d00c6ea7eedfd1e2027554745
+      size: 7119
     outs:
     - path: data/processed/fanuel/submission.csv
       hash: md5
