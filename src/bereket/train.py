@@ -14,6 +14,13 @@ train, 2017-07-15 .. 07-30), never the validation window itself, so the
 validation score is not tuned on the validation data. After early stopping
 the model is refit on all of train (fit + inner) with the found number of
 trees; --no-refit skips that.
+
+Kaggle submission: --submit runs the same steps one 16-day window later -
+tune on 07-31 .. 08-15, refit on everything up to 08-15, predict the test
+window 08-16 .. 08-31 - and writes reports/bereket/submission_<model>.csv.
+There is no score for that window here; upload the file to Kaggle for one.
+
+    python -m src.bereket.train --model lgbm --submit
 """
 
 from __future__ import annotations
@@ -36,6 +43,8 @@ from src.bereket.features import build_features, load_prepared
 from src.common.evaluate import (
     HORIZON_DAYS,
     TARGET,
+    TEST_END,
+    TEST_START,
     TRAIN_END,
     VALID_END,
     VALID_START,
@@ -355,6 +364,34 @@ def apply_zero_rule(frame: pd.DataFrame, pred: np.ndarray, zeros: pd.DataFrame) 
     return out
 
 
+def windows(df: pd.DataFrame, args) -> tuple[pd.DataFrame, ...]:
+    """(fit, inner, train, target) for a normal run or a --submit run.
+
+    normal:   fit <= 07-14 | inner 07-15..07-30 | train <= 07-30 | target = validation
+    --submit: fit <= 07-30 | inner 07-31..08-15 | train <= 08-15 | target = Kaggle test
+    """
+    train, valid = split_train_valid(df)
+    train = train.loc[train["date"] >= args.train_start]
+    if not args.submit:
+        return (train.loc[train["date"] < INNER_START], train.loc[train["date"] >= INNER_START],
+                train, valid)
+    test = df.loc[df["date"].between(TEST_START, TEST_END)]
+    return train, valid, pd.concat([train, valid]), test
+
+
+def write_submission(test: pd.DataFrame, pred: np.ndarray, model: str) -> Path:
+    """Kaggle format: id,sales - one row per test id, nothing missing."""
+    sample = pd.read_csv(REPO_ROOT / "data" / "raw" / "sample_submission.csv", usecols=["id"])
+    sub = pd.DataFrame({"id": test["id"].astype("int64").to_numpy(), "sales": pred})
+    if len(sub) != len(sample) or set(sub["id"]) != set(sample["id"]):
+        raise ValueError(f"submission ids do not match sample_submission.csv ({len(sub)} rows)")
+    if sub["sales"].isna().any() or (sub["sales"] < 0).any():
+        raise ValueError("submission has missing or negative sales")
+    path = REPO_ROOT / "reports" / "bereket" / f"submission_{model}.csv"
+    sub.sort_values("id").to_csv(path, index=False)
+    return path
+
+
 def raw_data_md5() -> str:
     meta = yaml.safe_load((REPO_ROOT / "data" / "raw.dvc").read_text())
     return meta["outs"][0]["md5"]
@@ -391,6 +428,8 @@ def main() -> None:
                         help="ets: damped additive trend, or no trend")
     parser.add_argument("--no-refit", action="store_true",
                         help="score validation with the early-stopped model instead of refitting on all of train")
+    parser.add_argument("--submit", action="store_true",
+                        help="train up to 08-15 and write a Kaggle submission for 08-16 .. 08-31")
     parser.add_argument("--no-mlflow", action="store_true", help="don't log the run")
     parser.add_argument("--no-register", action="store_true",
                         help="log the run but don't save/register the model")
@@ -408,15 +447,13 @@ def main() -> None:
 
     start = time.perf_counter()
     df, features = build_features(load_prepared(args.processed_dir))
-    train, valid = split_train_valid(df)
-    train = train.loc[train["date"] >= args.train_start]
-    fit = train.loc[train["date"] < INNER_START]
-    inner = train.loc[train["date"] >= INNER_START]
+    fit, inner, train, valid = windows(df, args)      # with --submit, valid = test rows
     log.info(
-        "fit %s .. %s (%d rows) | inner %s .. %s (%d) | valid %s .. %s (%d)",
+        "fit %s .. %s (%d rows) | inner %s .. %s (%d) | %s %s .. %s (%d)",
         fit["date"].min().date(), fit["date"].max().date(), len(fit),
         inner["date"].min().date(), inner["date"].max().date(), len(inner),
-        VALID_START.date(), VALID_END.date(), len(valid),
+        "test" if args.submit else "valid",
+        valid["date"].min().date(), valid["date"].max().date(), len(valid),
     )
 
     pred_inner, pred_valid, model_params, importance, final_model = MODELS[args.model](
@@ -430,11 +467,16 @@ def main() -> None:
     log.info("zero rule: %d series predicted 0 (no sales in last %d days)", len(zeros), args.zero_days)
 
     score_inner = rmsle(inner[TARGET], pred_inner)
-    score = rmsle(valid[TARGET], pred_valid)
     minutes = (time.perf_counter() - start) / 60
     log.info("RMSLE inner holdout: %.5f", score_inner)
-    log.info("RMSLE on validation (%s .. %s): %.5f   [%.1f min]",
-             VALID_START.date(), VALID_END.date(), score, minutes)
+    if args.submit:
+        score, submission = None, write_submission(valid, pred_valid, args.model)
+        log.info("submission written: %s   [%.1f min]", submission.relative_to(REPO_ROOT), minutes)
+        log.info("no local score for the test window - upload to Kaggle for one")
+    else:
+        score, submission = rmsle(valid[TARGET], pred_valid), None
+        log.info("RMSLE on validation (%s .. %s): %.5f   [%.1f min]",
+                 VALID_START.date(), VALID_END.date(), score, minutes)
     if importance is not None:
         log.info("top features (%s): %s", importance.name, ", ".join(importance.head(10).index))
 
@@ -445,17 +487,21 @@ def main() -> None:
     import mlflow
 
     mlflow.set_experiment(EXPERIMENT)
-    with mlflow.start_run(run_name=f"{args.model}-features-v2") as run:
+    run_name = f"{args.model}-submit" if args.submit else f"{args.model}-features-v2"
+    with mlflow.start_run(run_name=run_name) as run:
         mlflow.set_tags({
             "author": "bereket",
             "model": args.model,
+            "mode": "submit" if args.submit else "validate",
             "git_sha": git("rev-parse", "HEAD"),
             "git_branch": git("rev-parse", "--abbrev-ref", "HEAD"),
         })
         mlflow.log_params({
             **model_params,
             "train_start": args.train_start.date().isoformat(),
-            "inner_start": INNER_START.date().isoformat(),
+            "inner_start": inner["date"].min().date().isoformat(),
+            "fit_end": fit["date"].max().date().isoformat(),
+            "train_end_used": train["date"].max().date().isoformat(),
             "train_end": TRAIN_END.date().isoformat(),
             "valid_start": VALID_START.date().isoformat(),
             "valid_end": VALID_END.date().isoformat(),
@@ -463,17 +509,17 @@ def main() -> None:
             "n_features": len(features),
             "raw_data_md5": raw_data_md5(),
         })
-        mlflow.log_metrics({
-            "rmsle_val": score,
-            "rmsle_inner": score_inner,
-            "n_zero_series": len(zeros),
-            "minutes": minutes,
-        })
+        metrics = {"rmsle_inner": score_inner, "n_zero_series": len(zeros), "minutes": minutes}
+        if score is not None:
+            metrics["rmsle_val"] = score
+        mlflow.log_metrics(metrics)
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "features.json").write_text(json.dumps(features, indent=2))
             if importance is not None:
                 importance.to_csv(Path(tmp) / "feature_importance.csv")
             mlflow.log_artifacts(tmp)
+        if submission is not None:
+            mlflow.log_artifact(str(submission))
         if args.no_register:
             log.info("--no-register: model not saved/registered")
         elif final_model is None:
