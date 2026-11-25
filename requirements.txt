@@ -9,3 +9,9 @@ dvc[s3]>=3.50
 mlflow>=2.14
 python-dotenv>=1.0
 pytest>=8.0
+fastapi
+uvicorn
+prometheus-fastapi-instrumentator
+python-logging-loki
+joblib
+lightgbm
