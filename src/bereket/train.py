@@ -21,6 +21,12 @@ window 08-16 .. 08-31 - and writes reports/bereket/submission_<model>.csv.
 There is no score for that window here; upload the file to Kaggle for one.
 
     python -m src.bereket.train --model lgbm --submit
+
+Backtest: --backtest N scores N 16-day windows (the validation window and
+the N-1 before it) and reports their mean - one window can be lucky, as the
+first Kaggle upload showed (0.3957 local vs 0.4193 on Kaggle).
+
+    python -m src.bereket.train --model lgbm --backtest 4
 """
 
 from __future__ import annotations
@@ -43,20 +49,15 @@ from src.bereket.features import build_features, load_prepared
 from src.common.evaluate import (
     HORIZON_DAYS,
     TARGET,
-    TEST_END,
-    TEST_START,
     TRAIN_END,
     VALID_END,
     VALID_START,
     rmsle,
-    split_train_valid,
 )
 
 EXPERIMENT = "store-sales-bereket"
 KEYS = ["store_nbr", "family"]
 REPO_ROOT = Path(__file__).resolve().parents[2]
-
-INNER_START = TRAIN_END - pd.Timedelta(days=HORIZON_DAYS - 1)   # 2017-07-15
 
 log = logging.getLogger("bereket.train")
 
@@ -364,19 +365,48 @@ def apply_zero_rule(frame: pd.DataFrame, pred: np.ndarray, zeros: pd.DataFrame) 
     return out
 
 
-def windows(df: pd.DataFrame, args) -> tuple[pd.DataFrame, ...]:
-    """(fit, inner, train, target) for a normal run or a --submit run.
+def windows(df: pd.DataFrame, train_start: pd.Timestamp, shift_days: int) -> tuple[pd.DataFrame, ...]:
+    """(fit, inner, train, target): the frozen split, moved by `shift_days`.
 
-    normal:   fit <= 07-14 | inner 07-15..07-30 | train <= 07-30 | target = validation
-    --submit: fit <= 07-30 | inner 07-31..08-15 | train <= 08-15 | target = Kaggle test
+    shift   0: fit <= 07-14 | inner 07-15..07-30 | train <= 07-30 | target = validation 07-31..08-15
+    shift +16: fit <= 07-30 | inner 07-31..08-15 | train <= 08-15 | target = Kaggle test (--submit)
+    shift -16: everything 16 days earlier - one backtest window (--backtest)
     """
-    train, valid = split_train_valid(df)
-    train = train.loc[train["date"] >= args.train_start]
-    if not args.submit:
-        return (train.loc[train["date"] < INNER_START], train.loc[train["date"] >= INNER_START],
-                train, valid)
-    test = df.loc[df["date"].between(TEST_START, TEST_END)]
-    return train, valid, pd.concat([train, valid]), test
+    shift = pd.Timedelta(days=shift_days)
+    train_end = TRAIN_END + shift
+    inner_start = train_end - pd.Timedelta(days=HORIZON_DAYS - 1)
+    dates = df["date"]
+    train = df.loc[dates.between(train_start, train_end)]
+    target = df.loc[dates.between(VALID_START + shift, VALID_END + shift)]
+    return train.loc[train["date"] < inner_start], train.loc[train["date"] >= inner_start], train, target
+
+
+def run_window(df: pd.DataFrame, features: list[str], args, shift_days: int) -> dict:
+    """Fit on one window and predict its target 16 days; score it if labels exist."""
+    fit, inner, train, target = windows(df, args.train_start, shift_days)
+    log.info(
+        "fit %s .. %s (%d rows) | inner %s .. %s (%d) | target %s .. %s (%d)",
+        fit["date"].min().date(), fit["date"].max().date(), len(fit),
+        inner["date"].min().date(), inner["date"].max().date(), len(inner),
+        target["date"].min().date(), target["date"].max().date(), len(target),
+    )
+    pred_inner, pred, params, importance, final_model = MODELS[args.model](
+        fit, inner, train, target, features, args
+    )
+    # zero rule: decided from data before each window only
+    pred_inner = apply_zero_rule(inner, pred_inner, zero_series(fit, args.zero_days))
+    zeros = zero_series(train, args.zero_days)
+    pred = apply_zero_rule(target, pred, zeros)
+    log.info("zero rule: %d series predicted 0 (no sales in last %d days)", len(zeros), args.zero_days)
+
+    labelled = target[TARGET].notna().all()
+    return {
+        "fit": fit, "inner": inner, "train": train, "target": target, "pred": pred,
+        "score_inner": rmsle(inner[TARGET], pred_inner),
+        "score": rmsle(target[TARGET], pred) if labelled else None,
+        "params": params, "importance": importance, "final_model": final_model,
+        "n_zero_series": len(zeros),
+    }
 
 
 def write_submission(test: pd.DataFrame, pred: np.ndarray, model: str) -> Path:
@@ -430,6 +460,8 @@ def main() -> None:
                         help="score validation with the early-stopped model instead of refitting on all of train")
     parser.add_argument("--submit", action="store_true",
                         help="train up to 08-15 and write a Kaggle submission for 08-16 .. 08-31")
+    parser.add_argument("--backtest", type=int, default=0, metavar="N",
+                        help="score N 16-day windows ending with the validation window, and average them")
     parser.add_argument("--no-mlflow", action="store_true", help="don't log the run")
     parser.add_argument("--no-register", action="store_true",
                         help="log the run but don't save/register the model")
@@ -445,36 +477,38 @@ def main() -> None:
         if git("status", "--porcelain", "--untracked-files=no"):
             log.warning("uncommitted changes - the git_sha tag will not match the code that ran")
 
+    if args.backtest and args.submit:
+        raise SystemExit("--backtest and --submit don't go together")
+
     start = time.perf_counter()
     df, features = build_features(load_prepared(args.processed_dir))
-    fit, inner, train, valid = windows(df, args)      # with --submit, valid = test rows
-    log.info(
-        "fit %s .. %s (%d rows) | inner %s .. %s (%d) | %s %s .. %s (%d)",
-        fit["date"].min().date(), fit["date"].max().date(), len(fit),
-        inner["date"].min().date(), inner["date"].max().date(), len(inner),
-        "test" if args.submit else "valid",
-        valid["date"].min().date(), valid["date"].max().date(), len(valid),
-    )
 
-    pred_inner, pred_valid, model_params, importance, final_model = MODELS[args.model](
-        fit, inner, train, valid, features, args
-    )
+    if args.backtest:
+        # oldest window first; the last one is the frozen validation window
+        shifts = [-HORIZON_DAYS * k for k in reversed(range(args.backtest))]
+        results = [run_window(df, features, args, shift) for shift in shifts]
+        for r in results:
+            log.info("backtest %s .. %s: RMSLE %.5f (inner %.5f)", r["target"]["date"].min().date(),
+                     r["target"]["date"].max().date(), r["score"], r["score_inner"])
+        scores = np.array([r["score"] for r in results])
+        log.info("backtest mean RMSLE over %d windows: %.5f (std %.5f)",
+                 len(scores), scores.mean(), scores.std())
+        res = results[-1]
+    else:
+        res = run_window(df, features, args, HORIZON_DAYS if args.submit else 0)
+        results = [res]
 
-    # zero rule: decided from data before each window only
-    pred_inner = apply_zero_rule(inner, pred_inner, zero_series(fit, args.zero_days))
-    zeros = zero_series(train, args.zero_days)
-    pred_valid = apply_zero_rule(valid, pred_valid, zeros)
-    log.info("zero rule: %d series predicted 0 (no sales in last %d days)", len(zeros), args.zero_days)
-
-    score_inner = rmsle(inner[TARGET], pred_inner)
+    fit, inner, train, valid = res["fit"], res["inner"], res["train"], res["target"]
+    score_inner, score, zeros = res["score_inner"], res["score"], res["n_zero_series"]
+    importance, final_model, model_params = res["importance"], res["final_model"], res["params"]
     minutes = (time.perf_counter() - start) / 60
     log.info("RMSLE inner holdout: %.5f", score_inner)
+    submission = None
     if args.submit:
-        score, submission = None, write_submission(valid, pred_valid, args.model)
+        submission = write_submission(valid, res["pred"], args.model)
         log.info("submission written: %s   [%.1f min]", submission.relative_to(REPO_ROOT), minutes)
         log.info("no local score for the test window - upload to Kaggle for one")
     else:
-        score, submission = rmsle(valid[TARGET], pred_valid), None
         log.info("RMSLE on validation (%s .. %s): %.5f   [%.1f min]",
                  VALID_START.date(), VALID_END.date(), score, minutes)
     if importance is not None:
@@ -486,13 +520,14 @@ def main() -> None:
 
     import mlflow
 
+    mode = "submit" if args.submit else f"backtest{args.backtest}" if args.backtest else "validate"
     mlflow.set_experiment(EXPERIMENT)
-    run_name = f"{args.model}-submit" if args.submit else f"{args.model}-features-v2"
+    run_name = f"{args.model}-features-v2" if mode == "validate" else f"{args.model}-{mode}"
     with mlflow.start_run(run_name=run_name) as run:
         mlflow.set_tags({
             "author": "bereket",
             "model": args.model,
-            "mode": "submit" if args.submit else "validate",
+            "mode": mode,
             "git_sha": git("rev-parse", "HEAD"),
             "git_branch": git("rev-parse", "--abbrev-ref", "HEAD"),
         })
@@ -507,11 +542,17 @@ def main() -> None:
             "valid_end": VALID_END.date().isoformat(),
             "zero_days": args.zero_days,
             "n_features": len(features),
+            "backtest_windows": args.backtest,
             "raw_data_md5": raw_data_md5(),
         })
-        metrics = {"rmsle_inner": score_inner, "n_zero_series": len(zeros), "minutes": minutes}
+        metrics = {"rmsle_inner": score_inner, "n_zero_series": zeros, "minutes": minutes}
         if score is not None:
             metrics["rmsle_val"] = score
+        if args.backtest:
+            for r in results:
+                metrics[f"rmsle_bt_{r['target']['date'].min():%m%d}"] = r["score"]
+            metrics["rmsle_bt_mean"] = float(scores.mean())
+            metrics["rmsle_bt_std"] = float(scores.std())
         mlflow.log_metrics(metrics)
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "features.json").write_text(json.dumps(features, indent=2))
@@ -520,8 +561,8 @@ def main() -> None:
             mlflow.log_artifacts(tmp)
         if submission is not None:
             mlflow.log_artifact(str(submission))
-        if args.no_register:
-            log.info("--no-register: model not saved/registered")
+        if args.no_register or args.backtest:
+            log.info("model not saved/registered (--no-register or --backtest)")
         elif final_model is None:
             log.info("%s has no single model object to save - nothing registered", args.model)
         else:
