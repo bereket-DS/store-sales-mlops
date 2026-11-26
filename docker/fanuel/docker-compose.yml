@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   api:
     build:
@@ -6,6 +8,10 @@ services:
     command: uvicorn monitoring.fanuel.api:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
+    volumes:
+      - ../../models:/app/models
+    env_file:
+      - ../../.env
     depends_on:
       - loki
 
@@ -22,6 +28,13 @@ services:
       - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      # 🔥 NEW: Auto-provision the data sources (Prometheus & Loki)
+      - ../../monitoring/fanuel/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+      # Auto-provision the dashboard config
+      - ../../monitoring/fanuel/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml
+      # Auto-provision the actual JSON dashboard
+      - ../../monitoring/fanuel/grafana_dashboard.json:/etc/grafana/provisioning/dashboards/grafana_dashboard.json
     depends_on:
       - prometheus
 
