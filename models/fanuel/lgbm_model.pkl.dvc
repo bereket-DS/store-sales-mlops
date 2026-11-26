@@ -1,0 +1,4 @@
+outs:
+- md5: e8b083a4e7736488cf23d09d02910506
+  size: 930271
+  path: lgbm_model.pkl

@@ -1,0 +1,10 @@
+apiVersion: 1
+providers:
+  - name: 'Fanuel Dashboard'
+    orgId: 1
+    folder: 'Fanuel'
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /etc/grafana/provisioning/dashboards

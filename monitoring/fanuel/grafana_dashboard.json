@@ -4,7 +4,7 @@
   "metadata": {
     "name": "add72b8",
     "namespace": "default",
-    "uid": "8fb0a23b-903f-4821-8967-5170ac5ff308",
+    "uid": "fanuel-dashboard-uid",
     "resourceVersion": "1795645179467980",
     "generation": 10,
     "creationTimestamp": "2026-11-25T21:46:56Z",
@@ -62,7 +62,7 @@
                       "group": "prometheus",
                       "version": "v0",
                       "datasource": {
-                        "name": "fg5ek5wowuq68b"
+                        "name": "prometheus-uid"
                       },
                       "spec": {
                         "editorMode": "code",
@@ -176,7 +176,7 @@
                       "group": "loki",
                       "version": "v0",
                       "datasource": {
-                        "name": "cg5elumfyrr40d"
+                        "name": "loki-uid"
                       },
                       "spec": {
                         "direction": "backward",
@@ -240,7 +240,7 @@
                       "group": "prometheus",
                       "version": "v0",
                       "datasource": {
-                        "name": "fg5ek5wowuq68b"
+                        "name": "prometheus-uid"
                       },
                       "spec": {
                         "editorMode": "code",
@@ -354,7 +354,7 @@
                       "group": "prometheus",
                       "version": "v0",
                       "datasource": {
-                        "name": "fg5ek5wowuq68b"
+                        "name": "prometheus-uid"
                       },
                       "spec": {
                         "editorMode": "code",
@@ -439,7 +439,7 @@
                       "group": "prometheus",
                       "version": "v0",
                       "datasource": {
-                        "name": "fg5ek5wowuq68b"
+                        "name": "prometheus-uid"
                       },
                       "spec": {
                         "editorMode": "code",
